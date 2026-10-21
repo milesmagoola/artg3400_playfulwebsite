@@ -28,14 +28,29 @@
       <!-- <a-box id="plank" position="0 0.85 -6" width="3" height="0.15" depth="0.4" color="lightgray"> </a-box> -->
 
       <a-box
+        id="circle"
+        position="0 5 -8"
+        width="3"
+        height="3"
+        depth="0"
+        color="Violet"
+        animation="property: rotation; to: 0 5 5; dur: 1200; dir: alternate; loop: true; easing: easeInOutSine"
+        <a-entity geometry="primitive: cone; width: 1; height: 1; depth: 1">
+        </a-entity>
+        
+      ></a-box>
+
+      <a-box
         id="plank"
         position="0 0.85 -6"
         width="3"
         height="0.15"
         depth="0.4"
         color="MediumAquamarine"
-        animation="property: scale; to: 55, 5, 5; dur: 1200; dir: alternate; loop: true; easing: easeInOutSine"
+        animation="property: scale; to: 6, 3, 2; dur: 1200; dir: alternate; loop: true; easing: easeInOutSine"
         animation="property: rotation; to: 0 5 5; dur: 1200; dir: alternate; loop: true; easing: easeInOutSine"
+        <a-entity geometry="primitive: dodecahedron; width: 1; height: 1; depth: 1">
+        </a-entity>
       ></a-box>
 
       <!-- camera -->
