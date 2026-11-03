@@ -89,6 +89,7 @@
 
       // The front cover of the book.
       const COVER_IMAGE = BASE + "cover.png";
+
       // The back cover of the book.
       const BACK_COVER_IMAGE = BASE + "backcover.png";
 
@@ -116,7 +117,7 @@
         pause: BASE + "pause-btn.png",
         buttonX: 0,
         buttonY: 0,
-        buttonSize: 0.7
+        buttonSize: 0.3
       };
 
       // =====================================================
@@ -143,9 +144,7 @@
             (tex) => {
               if ("colorSpace" in tex) tex.colorSpace = THREE.SRGBColorSpace;
               const part = d.uMax - d.uMin;
-              const h =
-                d.height ||
-                (d.width * tex.image.height) / (tex.image.width * part);
+              const h = d.height || (d.width * tex.image.height) / (tex.image.width * part);
 
               const geo = new THREE.PlaneGeometry(d.width, h);
               const uv = geo.attributes.uv;
@@ -172,6 +171,7 @@
       });
 
       // Builds the book, shows the spread when open, and runs the three-click sequence.
+      // While the book is with the viewer, it follows the camera and turns to face it.
       AFRAME.registerComponent("book-controller", {
         schema: {
           distance: { default: 1 },
@@ -179,17 +179,31 @@
           openAngle: { default: -178 },
           openDur: { default: 800 },
           pageW: { default: 0.52 }, // one page; 2 x 0.52 / 0.8 matches the spread shape
-          pageH: { default: 0.8 }
+          pageH: { default: 0.8 },
+          follow: { default: 3 } // how quickly it follows the viewer. 0 = no following.
         },
 
         init: function () {
           this.buildBook();
           this.home = this.el.object3D.position.clone();
+          const r0 = this.el.getAttribute("rotation");
+          this.homeRot = { x: r0.x, y: r0.y, z: r0.z };
           this.busy = false;
           // Steps: 0 = at home, 1 = at viewer (closed), 2 = open, 3 = closing then returning
           this.step = 0;
+          this.following = false;
+          this.offset = 0;
+          this.camPos = new THREE.Vector3();
+          this.camQuat = new THREE.Quaternion();
+          this.fwd = new THREE.Vector3();
+          this.right = new THREE.Vector3();
+          this.goal = new THREE.Vector3();
+          this.aim = new THREE.Object3D();
 
           this.el.addEventListener("animationcomplete__move", () => {
+            if (this.step === 1) {
+              this.following = true; // arrived: start following the viewer
+            }
             if (this.step === 3) {
               this.step = 0;
               this.el.sceneEl.emit("book-home", { book: this.el });
@@ -199,7 +213,9 @@
 
           this.hinge.addEventListener("animationcomplete__swing", () => {
             if (this.step === 3) {
-              this.travel(this.home, "y", "easeInOutCubic", "easeInOutSine");
+              this.following = false;
+              this.syncAttributes();
+              this.travel(this.home, this.homeRotTarget(), "easeInOutCubic", "easeInOutSine");
             } else {
               this.busy = false;
               if (this.step === 2) {
@@ -213,14 +229,10 @@
             this.busy = true;
 
             if (this.step === 0) {
-              // Offset by half a page, so the OPEN spread is centered in front of the viewer.
-              const target = new THREE.Vector3(
-                this.data.pageW / 2,
-                0,
-                -this.data.distance
-              );
+              const target = new THREE.Vector3(0, 0, -this.data.distance);
               this.el.sceneEl.camera.localToWorld(target);
-              this.travel(target, "y", "easeInOutCubic", "easeInOutSine");
+              const r = this.el.getAttribute("rotation");
+              this.travel(target, { x: r.x, y: r.y + 360, z: r.z }, "easeInOutCubic", "easeInOutSine");
               this.el.sceneEl.emit("book-leaving", { book: this.el });
               this.step = 1;
             } else if (this.step === 1) {
@@ -234,107 +246,92 @@
           });
         },
 
+        // Every frame while with the viewer: glide to a point in front of the camera and face it.
+        tick: function (t, dtMs) {
+          if (!this.following || !this.data.follow) return;
+          const dt = Math.min(dtMs / 1000, 0.05);
+          const cam = this.el.sceneEl.camera;
+          if (!dt || !cam) return;
+
+          cam.getWorldPosition(this.camPos);
+          cam.getWorldQuaternion(this.camQuat);
+          this.fwd.set(0, 0, -1).applyQuaternion(this.camQuat);
+          this.right.set(1, 0, 0).applyQuaternion(this.camQuat);
+          this.right.y = 0;
+          this.right.normalize();
+
+          const k = 1 - Math.exp(-this.data.follow * dt);
+
+          // Open: move right by half a page, so the spread is centered. Closed: centered.
+          const wantOffset = this.step === 2 ? this.data.pageW / 2 : 0;
+          this.offset += (wantOffset - this.offset) * k;
+
+          this.goal
+            .copy(this.camPos)
+            .addScaledVector(this.fwd, this.data.distance)
+            .addScaledVector(this.right, this.offset);
+
+          const obj = this.el.object3D;
+          obj.position.lerp(this.goal, k);
+          this.aim.position.copy(obj.position);
+          this.aim.lookAt(this.camPos);
+          obj.quaternion.slerp(this.aim.quaternion, k);
+        },
+
+        // Copy the followed position and rotation back into the attributes,
+        // so the return animation starts from where the book really is.
+        syncAttributes: function () {
+          const o = this.el.object3D;
+          const deg = THREE.MathUtils.radToDeg;
+          this.el.setAttribute("position", { x: o.position.x, y: o.position.y, z: o.position.z });
+          this.el.setAttribute("rotation", { x: deg(o.rotation.x), y: deg(o.rotation.y), z: deg(o.rotation.z) });
+        },
+
+        // Return rotation: one turn, ending exactly in the shelf orientation.
+        homeRotTarget: function () {
+          const cur = this.el.getAttribute("rotation");
+          const h = this.homeRot;
+          const turns = Math.round((cur.y - h.y) / 360);
+          return { x: h.x, y: h.y + 360 * (turns + 1), z: h.z };
+        },
+
         buildBook: function () {
           const W = this.data.pageW;
           const H = this.data.pageH;
           const make = (tag, attrs, parent) => {
             const e = document.createElement(tag);
             for (const k in attrs) e.setAttribute(k, attrs[k]);
+            e.classList.add("clickable"); // every part of the book can be clicked
             parent.appendChild(e);
             return e;
           };
 
           // back cover
-          make(
-            "a-box",
-            {
-              position: "0 0 -0.025",
-              width: W,
-              height: H,
-              depth: 0.01,
-              color: "#5a3e2b"
-            },
-            this.el
-          );
+          make("a-box", { position: "0 0 -0.025", width: W, height: H, depth: 0.01, color: "#5a3e2b" }, this.el);
           // pages
-          const pages = make(
-            "a-box",
-            {
-              position: "0 0 0",
-              width: W - 0.01,
-              height: H - 0.01,
-              depth: 0.04,
-              color: "#f5f0e1"
-            },
-            this.el
-          );
+          const pages = make("a-box", { position: "0 0 0", width: W - 0.01, height: H - 0.01, depth: 0.04, color: "#f5f0e1" }, this.el);
           // hinge at the spine, with the front cover offset by half its width
-          this.hinge = make(
-            "a-entity",
-            { class: "hinge", position: `${-W / 2} 0 0.031` },
-            this.el
-          );
-          const cover = make(
-            "a-box",
-            {
-              position: `${W / 2} 0 0`,
-              width: W,
-              height: H,
-              depth: 0.02,
-              color: "#8b2e2e"
-            },
-            this.hinge
-          );
+          this.hinge = make("a-entity", { class: "hinge", position: `${-W / 2} 0 0.031` }, this.el);
+          const cover = make("a-box", { position: `${W / 2} 0 0`, width: W, height: H, depth: 0.02, color: "#8b2e2e" }, this.hinge);
 
           // Front cover image: on the outside of the cover, facing the viewer.
           const front = make("a-entity", { position: "0 0 0.0103" }, cover);
-          front.setAttribute("flat-image", {
-            src: COVER_IMAGE,
-            width: W,
-            height: H
-          });
+          front.setAttribute("flat-image", { src: COVER_IMAGE, width: W, height: H });
 
           // Back cover image: on the outside of the back cover, facing away from the pages.
-          const back = make(
-            "a-entity",
-            { position: "0 0 -0.0303", rotation: "0 180 0" },
-            this.el
-          );
-          back.setAttribute("flat-image", {
-            src: BACK_COVER_IMAGE,
-            width: W,
-            height: H
-          });
+          const back = make("a-entity", { position: "0 0 -0.0303", rotation: "0 180 0" }, this.el);
+          back.setAttribute("flat-image", { src: BACK_COVER_IMAGE, width: W, height: H });
 
           // Left half of the spread: on the inside of the cover, turned to face the pages.
-          const left = make(
-            "a-entity",
-            { position: "0 0 -0.0103", rotation: "0 180 0" },
-            cover
-          );
-          left.setAttribute("flat-image", {
-            src: SPREAD_IMAGE,
-            width: W,
-            height: H,
-            uMin: 0,
-            uMax: 0.5
-          });
+          const left = make("a-entity", { position: "0 0 -0.0103", rotation: "0 180 0" }, cover);
+          left.setAttribute("flat-image", { src: SPREAD_IMAGE, width: W, height: H, uMin: 0, uMax: 0.5 });
 
           // Right half of the spread: on the front of the pages.
           const right = make("a-entity", { position: "0 0 0.0203" }, pages);
-          right.setAttribute("flat-image", {
-            src: SPREAD_IMAGE,
-            width: W,
-            height: H,
-            uMin: 0.5,
-            uMax: 1
-          });
+          right.setAttribute("flat-image", { src: SPREAD_IMAGE, width: W, height: H, uMin: 0.5, uMax: 1 });
         },
 
-        travel: function (pos, rotAxis, posEasing, rotEasing) {
-          const r = this.el.getAttribute("rotation");
-          const rot = { x: r.x, y: r.y, z: r.z };
-          rot[rotAxis] += 360;
+        travel: function (pos, rot, posEasing, rotEasing) {
           this.el.setAttribute("animation__move", {
             property: "position",
             to: `${pos.x} ${pos.y} ${pos.z}`,
@@ -378,7 +375,9 @@
           throwKeep: { default: 0.6 }, // part of the hand speed a released piece keeps
           maxThrow: { default: 4 }, // meters per second
           spinThreshold: { default: 1.5 }, // releases faster than this (m/s) make one slow turn
-          spinDur: { default: 2.4 } // seconds for that turn
+          spinDur: { default: 2.4 }, // seconds for that turn
+          clearAngle: { default: 40 }, // degrees: keep this far from the viewer's line to the book
+          clearStrength: { default: 4 }
         },
 
         init: function () {
@@ -448,6 +447,10 @@
           this.radial = new THREE.Vector3();
           this.prev = new THREE.Vector3();
           this.camPos = new THREE.Vector3();
+          this.bookEl = null;
+          this.bookPos = new THREE.Vector3();
+          this.bookDir = new THREE.Vector3();
+          this.perp = new THREE.Vector3();
 
           this.onDown = this.onDown.bind(this);
           this.onMove = this.onMove.bind(this);
@@ -467,9 +470,7 @@
           if (scene.canvas) attach();
           else scene.addEventListener("render-target-loaded", attach);
 
-          scene.addEventListener("book-opened", (e) =>
-            this.show(e.detail.book)
-          );
+          scene.addEventListener("book-opened", (e) => this.show(e.detail.book));
           scene.addEventListener("book-closing", () => this.hide());
         },
 
@@ -488,10 +489,8 @@
             -((e.clientY - r.top) / r.height) * 2 + 1
           );
           this.mouseInside =
-            e.clientX >= r.left &&
-            e.clientX <= r.right &&
-            e.clientY >= r.top &&
-            e.clientY <= r.bottom;
+            e.clientX >= r.left && e.clientX <= r.right &&
+            e.clientY >= r.top && e.clientY <= r.bottom;
           this.raycaster.setFromCamera(this.mouse, this.el.sceneEl.camera);
         },
 
@@ -526,8 +525,7 @@
           cam.getWorldPosition(this.camPos);
 
           // Remember how far out it was, unless it is still on its way back from a last hold.
-          if (!st.returning)
-            st.homeDist = st.outer.object3D.position.distanceTo(this.camPos);
+          if (!st.returning) st.homeDist = st.outer.object3D.position.distanceTo(this.camPos);
           st.returning = false;
           st.vel.set(0, 0, 0);
 
@@ -535,9 +533,7 @@
           const camDir = new THREE.Vector3();
           cam.getWorldDirection(camDir);
           const ray = this.raycaster.ray;
-          const near = ray.origin
-            .clone()
-            .addScaledVector(ray.direction, this.data.holdDist);
+          const near = ray.origin.clone().addScaledVector(ray.direction, this.data.holdDist);
           this.dragPlane.setFromNormalAndCoplanarPoint(camDir, near);
           st.target.copy(near);
 
@@ -549,9 +545,7 @@
         onMove: function (e) {
           this.updateMouse(e);
           if (!this.held) return;
-          if (
-            this.raycaster.ray.intersectPlane(this.dragPlane, this.dragPoint)
-          ) {
+          if (this.raycaster.ray.intersectPlane(this.dragPlane, this.dragPoint)) {
             this.held.target.copy(this.dragPoint);
             this.lastMoveT = performance.now();
           }
@@ -571,9 +565,7 @@
           if (handSpeed > this.data.spinThreshold && st.spinT < 0) {
             const camQuat = new THREE.Quaternion();
             this.el.sceneEl.camera.getWorldQuaternion(camQuat);
-            const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(
-              camQuat
-            );
+            const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(camQuat);
             st.spinDir = -(Math.sign(v.dot(camRight)) || 1);
             st.spinT = 0;
           }
@@ -621,10 +613,24 @@
                 const away = this.away.copy(pos).sub(this.closest);
                 const dist = away.length();
                 if (dist < d.repelRadius && dist > 0.0001) {
-                  f.addScaledVector(
-                    away.divideScalar(dist),
-                    d.repelStrength * (1 - dist / d.repelRadius)
-                  );
+                  f.addScaledVector(away.divideScalar(dist), d.repelStrength * (1 - dist / d.repelRadius));
+                }
+              }
+
+              // Keep clear of the viewer's line of sight to the book.
+              if (this.bookEl) {
+                this.bookEl.object3D.getWorldPosition(this.bookPos);
+                const bookDir = this.bookDir.copy(this.bookPos).sub(camPos).normalize();
+                const perp = this.perp.copy(pos).sub(camPos);
+                const along = perp.dot(bookDir);
+                if (along > 0) {
+                  perp.addScaledVector(bookDir, -along); // sideways distance from the sight line
+                  const side = perp.length() / along; // tangent of the angle off the sight line
+                  const limit = Math.tan(THREE.MathUtils.degToRad(d.clearAngle));
+                  if (side < limit) {
+                    if (perp.length() < 0.0001) perp.set(1, 0, 0);
+                    f.addScaledVector(perp.normalize(), d.clearStrength * (1 - side / limit));
+                  }
                 }
               }
 
@@ -635,21 +641,14 @@
                 if (r > 0.0001) radial.divideScalar(r);
                 const gap = st.homeDist - r;
                 f.addScaledVector(radial, d.returnStrength * gap);
-                if (Math.abs(gap) < 0.08 && st.vel.length() < 0.3)
-                  st.returning = false;
+                if (Math.abs(gap) < 0.08 && st.vel.length() < 0.3) st.returning = false;
               } else {
                 // Soft walls: stay around the viewer, not too near, not too far.
-                const flat = this.flat.set(
-                  pos.x - camPos.x,
-                  0,
-                  pos.z - camPos.z
-                );
+                const flat = this.flat.set(pos.x - camPos.x, 0, pos.z - camPos.z);
                 const r = flat.length();
                 if (r > 0.0001) flat.divideScalar(r);
-                if (r < d.minDist * 0.7)
-                  f.addScaledVector(flat, 3 * (d.minDist * 0.7 - r));
-                else if (r > d.maxDist + 1)
-                  f.addScaledVector(flat, -3 * (r - d.maxDist - 1));
+                if (r < d.minDist * 0.7) f.addScaledVector(flat, 3 * (d.minDist * 0.7 - r));
+                else if (r > d.maxDist + 1) f.addScaledVector(flat, -3 * (r - d.maxDist - 1));
               }
               const dy = pos.y - camPos.y;
               if (dy < -1.2) f.y += 3 * (-1.2 - dy);
@@ -664,8 +663,7 @@
             if (st.spinT >= 0) {
               st.spinT += dt / d.spinDur;
               const k = Math.min(st.spinT, 1);
-              st.spinAngle =
-                st.spinDir * 360 * (0.5 - 0.5 * Math.cos(Math.PI * k));
+              st.spinAngle = st.spinDir * 360 * (0.5 - 0.5 * Math.cos(Math.PI * k));
               if (st.spinT >= 1) {
                 st.spinT = -1;
                 st.spinAngle = 0;
@@ -674,17 +672,14 @@
 
             // Face the viewer, stay upright, with a slow tilt (plus any spin).
             obj.lookAt(camPos.x, pos.y, camPos.z);
-            obj.rotateZ(
-              THREE.MathUtils.degToRad(
-                Math.sin(time * 0.6 + st.ph1) * st.sway + st.spinAngle
-              )
-            );
+            obj.rotateZ(THREE.MathUtils.degToRad(Math.sin(time * 0.6 + st.ph1) * st.sway + st.spinAngle));
           });
         },
 
         // ---------- open and close ----------
 
         show: function (bookEl) {
+          this.bookEl = bookEl;
           const cam = this.el.sceneEl.camera;
           const camPos = new THREE.Vector3();
           const camQuat = new THREE.Quaternion();
@@ -708,17 +703,10 @@
             const side = i % 2 === 0 ? 1 : -1;
             const k = Math.floor(i / 2);
             const spread = perSide === 1 ? 0.5 : k / (perSide - 1);
-            const angle = side * (30 + spread * 45);
+            const angle = side * (45 + spread * 35); // starts outside the clear cone around the book
 
-            const dir = fwd
-              .clone()
-              .applyAxisAngle(
-                new THREE.Vector3(0, 1, 0),
-                THREE.MathUtils.degToRad(angle)
-              );
-            const dist =
-              this.data.minDist +
-              Math.random() * (this.data.maxDist - this.data.minDist);
+            const dir = fwd.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), THREE.MathUtils.degToRad(angle));
+            const dist = this.data.minDist + Math.random() * (this.data.maxDist - this.data.minDist);
             const p = camPos.clone().addScaledVector(dir, dist);
             p.y = camPos.y - 0.4 + (k % 3) * 0.6 + Math.random() * 0.2;
 
@@ -752,6 +740,7 @@
         },
 
         hide: function () {
+          this.bookEl = null;
           if (!this.origin) return;
           if (this.held) {
             this.held = null;
@@ -804,22 +793,14 @@
           const hit = document.createElement("a-plane");
           hit.setAttribute("width", P.buttonSize);
           hit.setAttribute("height", P.buttonSize);
-          hit.setAttribute(
-            "material",
-            "transparent: true; opacity: 0; depthWrite: false"
-          );
+          hit.setAttribute("material", "transparent: true; opacity: 0; depthWrite: false");
+          hit.setAttribute("class", "clickable");
           this.button.appendChild(hit);
 
           this.playIcon = document.createElement("a-entity");
-          this.playIcon.setAttribute("flat-image", {
-            src: P.play,
-            width: P.buttonSize
-          });
+          this.playIcon.setAttribute("flat-image", { src: P.play, width: P.buttonSize });
           this.pauseIcon = document.createElement("a-entity");
-          this.pauseIcon.setAttribute("flat-image", {
-            src: P.pause,
-            width: P.buttonSize
-          });
+          this.pauseIcon.setAttribute("flat-image", { src: P.pause, width: P.buttonSize });
           this.pauseIcon.setAttribute("visible", false);
           this.button.appendChild(this.playIcon);
           this.button.appendChild(this.pauseIcon);
@@ -831,11 +812,7 @@
           if (!SKY_VIDEO_ALWAYS_PLAYS) {
             window.addEventListener("yt-state", (e) => {
               if (e.detail === YT.PlayerState.PLAYING) this.setIcon(true);
-              else if (
-                e.detail === YT.PlayerState.PAUSED ||
-                e.detail === YT.PlayerState.ENDED
-              )
-                this.setIcon(false);
+              else if (e.detail === YT.PlayerState.PAUSED || e.detail === YT.PlayerState.ENDED) this.setIcon(false);
             });
           }
 
@@ -865,10 +842,7 @@
             }
           } else {
             const s = p.getPlayerState();
-            if (
-              s === YT.PlayerState.PLAYING ||
-              s === YT.PlayerState.BUFFERING
-            ) {
+            if (s === YT.PlayerState.PLAYING || s === YT.PlayerState.BUFFERING) {
               p.pauseVideo();
               this.setIcon(false);
             } else {
@@ -890,6 +864,7 @@
         },
 
         show: function () {
+          this.shown = true;
           const cam = this.el.sceneEl.camera;
           const camPos = new THREE.Vector3();
           const camQuat = new THREE.Quaternion();
@@ -917,6 +892,7 @@
         },
 
         hide: function () {
+          this.shown = false;
           this.restart("animation__grow", {
             property: "scale",
             to: "0.001 0.001 0.001",
@@ -928,6 +904,29 @@
             else window.ytPlayer.pauseVideo();
             this.setIcon(false);
           }
+        },
+
+        // While shown: follow the viewer at the same speed as the book, below it.
+        tick: function (t, dtMs) {
+          if (!this.shown) return;
+          const dt = Math.min(dtMs / 1000, 0.05);
+          const cam = this.el.sceneEl.camera;
+          if (!dt || !cam) return;
+          this.camPos = this.camPos || new THREE.Vector3();
+          this.camQuat = this.camQuat || new THREE.Quaternion();
+          this.goal = this.goal || new THREE.Vector3();
+          this.aim = this.aim || new THREE.Object3D();
+          cam.getWorldPosition(this.camPos);
+          cam.getWorldQuaternion(this.camQuat);
+          const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(this.camQuat);
+          const up = new THREE.Vector3(0, 1, 0).applyQuaternion(this.camQuat);
+          this.goal.copy(this.camPos).addScaledVector(fwd, this.data.distance).addScaledVector(up, -this.data.drop);
+          const k = 1 - Math.exp(-3 * dt);
+          const obj = this.el.object3D;
+          obj.position.lerp(this.goal, k);
+          this.aim.position.copy(obj.position);
+          this.aim.lookAt(this.camPos);
+          obj.quaternion.slerp(this.aim.quaternion, k);
         }
       });
 
@@ -948,12 +947,9 @@
             s = (s * 16807) % 2147483647;
             return (s - 1) / 2147483646;
           };
-          for (let i = 0; i < this.data.trees; i++)
-            this.tree(this.spot(this.data.clear, this.data.radius));
-          for (let i = 0; i < this.data.bushes; i++)
-            this.bush(this.spot(this.data.clear - 1, this.data.radius));
-          for (let i = 0; i < this.data.flowerPatches; i++)
-            this.flowerPatch(this.spot(2.5, 16));
+          for (let i = 0; i < this.data.trees; i++) this.tree(this.spot(this.data.clear, this.data.radius));
+          for (let i = 0; i < this.data.bushes; i++) this.bush(this.spot(this.data.clear - 1, this.data.radius));
+          for (let i = 0; i < this.data.flowerPatches; i++) this.flowerPatch(this.spot(2.5, 16));
         },
 
         pick: function (list) {
@@ -978,121 +974,58 @@
         },
 
         tree: function (p) {
-          const g = this.make(
-            "a-entity",
-            {
-              position: `${p.x} 0 ${p.z}`,
-              rotation: `0 ${this.rand() * 360} 0`
-            },
-            this.el
-          );
+          const g = this.make("a-entity", { position: `${p.x} 0 ${p.z}`, rotation: `0 ${this.rand() * 360} 0` }, this.el);
           const h = 1.5 + this.rand() * 2.5;
-          this.make(
-            "a-cylinder",
-            {
-              position: `0 ${h / 2} 0`,
-              radius: 0.18,
-              height: h,
-              "segments-radial": 6,
-              material: this.mat("#5a3a22")
-            },
-            g
-          );
+          this.make("a-cylinder", {
+            position: `0 ${h / 2} 0`, radius: 0.18, height: h,
+            "segments-radial": 6, material: this.mat("#5a3a22")
+          }, g);
           if (this.rand() < 0.55) {
             // Pine
             const ch = 3 + this.rand() * 1.5;
-            this.make(
-              "a-cone",
-              {
-                position: `0 ${h + ch / 2 - 0.4} 0`,
-                "radius-bottom": 1.3,
-                "radius-top": 0,
-                height: ch,
-                "segments-radial": 7,
-                material: this.mat(this.pick(["#2f5d3a", "#3a6b40", "#25503a"]))
-              },
-              g
-            );
+            this.make("a-cone", {
+              position: `0 ${h + ch / 2 - 0.4} 0`, "radius-bottom": 1.3, "radius-top": 0, height: ch,
+              "segments-radial": 7, material: this.mat(this.pick(["#2f5d3a", "#3a6b40", "#25503a"]))
+            }, g);
           } else {
             // Round leafy tree
-            this.make(
-              "a-sphere",
-              {
-                position: `0 ${h + 0.7} 0`,
-                radius: 1.1 + this.rand() * 0.6,
-                "segments-width": 7,
-                "segments-height": 5,
-                material: this.mat(this.pick(["#4f8a3c", "#5e9b45", "#447a35"]))
-              },
-              g
-            );
+            this.make("a-sphere", {
+              position: `0 ${h + 0.7} 0`, radius: 1.1 + this.rand() * 0.6,
+              "segments-width": 7, "segments-height": 5,
+              material: this.mat(this.pick(["#4f8a3c", "#5e9b45", "#447a35"]))
+            }, g);
           }
         },
 
         bush: function (p) {
-          const g = this.make(
-            "a-entity",
-            { position: `${p.x} 0 ${p.z}` },
-            this.el
-          );
+          const g = this.make("a-entity", { position: `${p.x} 0 ${p.z}` }, this.el);
           const color = this.pick(["#3f7a34", "#4a8a3a", "#356b2e"]);
           const n = 2 + Math.floor(this.rand() * 3);
           for (let i = 0; i < n; i++) {
             const r = 0.4 + this.rand() * 0.4;
-            this.make(
-              "a-sphere",
-              {
-                position: `${(this.rand() - 0.5) * 0.9} ${r * 0.7} ${(this.rand() - 0.5) * 0.9}`,
-                radius: r,
-                "segments-width": 6,
-                "segments-height": 4,
-                material: this.mat(color)
-              },
-              g
-            );
+            this.make("a-sphere", {
+              position: `${(this.rand() - 0.5) * 0.9} ${r * 0.7} ${(this.rand() - 0.5) * 0.9}`,
+              radius: r, "segments-width": 6, "segments-height": 4, material: this.mat(color)
+            }, g);
           }
         },
 
         flowerPatch: function (p) {
-          const color = this.pick([
-            "#e84a5f",
-            "#f7d046",
-            "#ffffff",
-            "#b57edc",
-            "#ff8c42"
-          ]);
+          const color = this.pick(["#e84a5f", "#f7d046", "#ffffff", "#b57edc", "#ff8c42"]);
           const n = 4 + Math.floor(this.rand() * 6);
           for (let i = 0; i < n; i++) {
             const x = p.x + (this.rand() - 0.5) * 1.5;
             const z = p.z + (this.rand() - 0.5) * 1.5;
             const h = 0.2 + this.rand() * 0.25;
-            const g = this.make(
-              "a-entity",
-              { position: `${x} 0 ${z}` },
-              this.el
-            );
-            this.make(
-              "a-cylinder",
-              {
-                position: `0 ${h / 2} 0`,
-                radius: 0.012,
-                height: h,
-                "segments-radial": 4,
-                material: this.mat("#3d7a2a")
-              },
-              g
-            );
-            this.make(
-              "a-sphere",
-              {
-                position: `0 ${h} 0`,
-                radius: 0.05,
-                "segments-width": 6,
-                "segments-height": 4,
-                material: this.mat(color)
-              },
-              g
-            );
+            const g = this.make("a-entity", { position: `${x} 0 ${z}` }, this.el);
+            this.make("a-cylinder", {
+              position: `0 ${h / 2} 0`, radius: 0.012, height: h,
+              "segments-radial": 4, material: this.mat("#3d7a2a")
+            }, g);
+            this.make("a-sphere", {
+              position: `0 ${h} 0`, radius: 0.05,
+              "segments-width": 6, "segments-height": 4, material: this.mat(color)
+            }, g);
           }
         }
       });
@@ -1112,10 +1045,7 @@
           maxW: { default: 0.24 },
           gapChance: { default: 0.15 },
           // soft orange, blue, pink and green, in several shades
-          colors: {
-            default:
-              "#f6b88a,#f2a477,#f9cfa8,#9fc5e8,#b7d3ef,#87b3dc,#f5b5c8,#f9c9d6,#ee9fb7,#a9d3a2,#c3e2b8,#8fc492"
-          },
+          colors: { default: "#f6b88a,#f2a477,#f9cfa8,#9fc5e8,#b7d3ef,#87b3dc,#f5b5c8,#f9c9d6,#ee9fb7,#a9d3a2,#c3e2b8,#8fc492" },
           textures: { default: "" } // comma list, for example: #spine1, #spine2, #spine3
         },
 
@@ -1128,9 +1058,7 @@
           };
           const range = (a, b) => a + rand() * (b - a);
           const colors = d.colors.split(",");
-          const textures = d.textures
-            ? d.textures.split(",").map((t) => t.trim())
-            : [];
+          const textures = d.textures ? d.textures.split(",").map((t) => t.trim()) : [];
           let x = d.left;
           let n = 0;
 
@@ -1150,27 +1078,18 @@
 
             const book = document.createElement("a-box");
             book.setAttribute("id", `${this.el.id}-book${n + 1}`);
-            book.setAttribute(
-              "position",
-              `${x + w / 2} ${d.shelfTop + h / 2} ${d.backZ + d.depth / 2}`
-            );
+            book.setAttribute("position", `${x + w / 2} ${d.shelfTop + h / 2} ${d.backZ + d.depth / 2}`);
             book.setAttribute("width", w);
             book.setAttribute("height", h);
             book.setAttribute("depth", d.depth);
-            book.setAttribute(
-              "color",
-              colors[Math.floor(rand() * colors.length)]
-            );
+            book.setAttribute("color", colors[Math.floor(rand() * colors.length)]);
 
             if (textures.length) {
               const spine = document.createElement("a-plane");
               spine.setAttribute("width", w);
               spine.setAttribute("height", h);
               spine.setAttribute("position", `0 0 ${d.depth / 2 + 0.001}`);
-              spine.setAttribute(
-                "material",
-                `src: ${textures[n % textures.length]}`
-              );
+              spine.setAttribute("material", `src: ${textures[n % textures.length]}`);
               book.appendChild(spine);
             }
 
@@ -1183,11 +1102,11 @@
     </script>
   </head>
   <body>
-    <!-- ".clickable *" also tests the parts INSIDE clickable entities (book pages, button hit area).
+    <!-- Every part of the book and the button hit area has the class "clickable" (set in the code).
          renderer alpha: the sky is transparent, so the video behind the canvas shows through. -->
     <a-scene
       cursor="rayOrigin: mouse"
-      raycaster="objects: .clickable, .clickable *"
+      raycaster="objects: .clickable"
       renderer="alpha: true"
       fog="type: linear; color: #e8957a; near: 12; far: 38"
     >
@@ -1225,72 +1144,17 @@
 
       <!-- BOOKSHELF -->
       <a-entity id="bookshelf" position="0 0 -5.6">
-        <a-box
-          id="backside"
-          position="0 2.75 -0.35"
-          width="4.3"
-          height="5.5"
-          depth="0.4"
-          color="#2e1a0f"
-        ></a-box>
-        <a-box
-          id="rightwall"
-          position="2 2.75 0"
-          width="0.3"
-          height="5.5"
-          depth="0.3"
-          color="#3e2415"
-        ></a-box>
-        <a-box
-          id="leftwall"
-          position="-2 2.75 0"
-          width="0.3"
-          height="5.5"
-          depth="0.3"
-          color="#3e2415"
-        ></a-box>
-        <a-box
-          id="ceiling"
-          position="0 5.35 0"
-          width="3.7"
-          height="0.3"
-          depth="0.3"
-          color="#3e2415"
-        ></a-box>
-        <a-box
-          id="floor"
-          position="0 0.15 0"
-          width="3.7"
-          height="0.3"
-          depth="0.3"
-          color="#3e2415"
-        ></a-box>
-        <a-box
-          id="shelf1"
-          position="0 3.8 0"
-          width="3.7"
-          height="0.1"
-          depth="0.3"
-          color="#2e1a0f"
-        ></a-box>
-        <a-box
-          id="shelf2"
-          position="0 2 0"
-          width="3.7"
-          height="0.1"
-          depth="0.3"
-          color="#2e1a0f"
-        ></a-box>
+        <a-box id="backside" position="0 2.75 -0.35" width="4.3" height="5.5" depth="0.4" color="#2e1a0f"></a-box>
+        <a-box id="rightwall" position="2 2.75 0" width="0.3" height="5.5" depth="0.3" color="#3e2415"></a-box>
+        <a-box id="leftwall" position="-2 2.75 0" width="0.3" height="5.5" depth="0.3" color="#3e2415"></a-box>
+        <a-box id="ceiling" position="0 5.35 0" width="3.7" height="0.3" depth="0.3" color="#3e2415"></a-box>
+        <a-box id="floor" position="0 0.15 0" width="3.7" height="0.3" depth="0.3" color="#3e2415"></a-box>
+        <a-box id="shelf1" position="0 3.8 0" width="3.7" height="0.1" depth="0.3" color="#2e1a0f"></a-box>
+        <a-box id="shelf2" position="0 2 0" width="3.7" height="0.1" depth="0.3" color="#2e1a0f"></a-box>
 
         <!-- Shelf 1: two short rows, with a space in the middle for the book -->
-        <a-entity
-          id="row1a"
-          book-row="seed: 5; shelfTop: 3.85; left: -1.85; right: -0.32"
-        ></a-entity>
-        <a-entity
-          id="row1b"
-          book-row="seed: 17; shelfTop: 3.85; left: 0.32; right: 1.85"
-        ></a-entity>
+        <a-entity id="row1a" book-row="seed: 5; shelfTop: 3.85; left: -1.85; right: -0.32"></a-entity>
+        <a-entity id="row1b" book-row="seed: 17; shelfTop: 3.85; left: 0.32; right: 1.85"></a-entity>
 
         <!-- Shelf 2 and the floor -->
         <a-entity id="row2" book-row="seed: 11; shelfTop: 2.05"></a-entity>
@@ -1342,9 +1206,7 @@
               }
             },
             onStateChange: (e) => {
-              window.dispatchEvent(
-                new CustomEvent("yt-state", { detail: e.data })
-              );
+              window.dispatchEvent(new CustomEvent("yt-state", { detail: e.data }));
             }
           }
         });
