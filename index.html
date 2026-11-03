@@ -5,58 +5,1362 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>My Scene</title>
     <script src="https://aframe.io/releases/1.8.0/aframe.min.js"></script>
+
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #1b1f3a;
+      }
+
+      /* Layer 1 (back): the YouTube video, scaled to cover the whole screen */
+      #yt-wrap {
+        position: fixed;
+        inset: 0;
+        z-index: 0;
+        overflow: hidden;
+        pointer-events: none;
+      }
+      #yt-wrap iframe {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        width: 100vw;
+        height: 56.25vw; /* 16:9 */
+        min-width: 177.78vh;
+        min-height: 100vh;
+        transform: translate(-50%, -50%);
+      }
+
+      /* Layer 2: sunset tint over the video. Blue at the top, warm at the horizon. */
+      #sky-tint {
+        position: fixed;
+        inset: 0;
+        z-index: 1;
+        pointer-events: none;
+        background: linear-gradient(
+          to bottom,
+          rgba(35, 60, 160, 0.6) 0%,
+          rgba(120, 80, 175, 0.45) 40%,
+          rgba(255, 135, 110, 0.5) 55%,
+          rgba(255, 160, 110, 0.55) 100%
+        );
+      }
+
+      /* Layer 2b: a stronger copy of the tint. It hides the video almost fully at the start,
+         and fades out when the book is clicked. */
+      #sky-veil {
+        position: fixed;
+        inset: 0;
+        z-index: 1;
+        pointer-events: none;
+        opacity: 1;
+        transition: opacity 2s ease-in-out;
+        background: linear-gradient(
+          to bottom,
+          rgba(35, 60, 160, 0.92) 0%,
+          rgba(120, 80, 175, 0.9) 40%,
+          rgba(255, 135, 110, 0.9) 55%,
+          rgba(255, 160, 110, 0.92) 100%
+        );
+      }
+
+      /* Layer 3 (front): the 3D scene, with a transparent sky */
+      a-scene {
+        position: fixed !important;
+        inset: 0;
+        z-index: 2;
+      }
+    </style>
+
+    <script>
+      // =====================================================
+      // ADD YOUR IMAGE ADDRESSES HERE. NOTHING ELSE TO EDIT.
+      // =====================================================
+
+      // The full two-page spread (JPG or PNG, not PDF).
+      // The left half goes on the left page, the right half on the right page.
+      const BASE =
+        "https://cdn.jsdelivr.net/gh/milesmagoola/artg3400_playfulwebsite@main/assets/";
+
+      const SPREAD_IMAGE = BASE + "full-spread.png";
+
+      // The front cover of the book.
+      const COVER_IMAGE = BASE + "cover.png";
+      // The back cover of the book.
+      const BACK_COVER_IMAGE = BASE + "backcover.png";
+
+      const FLOAT_IMAGES = [
+        BASE + "title.png",
+        BASE + "pop-ups_1A.png",
+        BASE + "pop-ups_1B.png",
+        BASE + "pop-ups_2.png",
+        BASE + "pop-ups_3.png",
+        BASE + "pop-ups_4.png",
+        BASE + "text_1.png",
+        BASE + "text_2.png",
+        BASE + "background.png"
+      ];
+
+      const YOUTUBE_ID = "D_i_4t1SffA";
+
+      // true  = the video always plays (muted) as the sky. The button turns the sound on and off.
+      // false = the video is still until the button is pressed. The button plays and pauses.
+      const SKY_VIDEO_ALWAYS_PLAYS = true;
+
+      // Play/pause button graphics (PNG). buttonSize = width in meters.
+      const MUSIC_PLAYER = {
+        play: BASE + "play-btn.png",
+        pause: BASE + "pause-btn.png",
+        buttonX: 0,
+        buttonY: 0,
+        buttonSize: 0.7
+      };
+
+      // =====================================================
+
+      // Shows an image on a flat plane. Keeps the image's shape.
+      // uMin / uMax show only part of the image (0 to 0.5 = left half).
+      AFRAME.registerComponent("flat-image", {
+        schema: {
+          src: { default: "" },
+          width: { default: 0.6 },
+          height: { default: 0 }, // 0 = calculate from the image shape
+          uMin: { default: 0 },
+          uMax: { default: 1 }
+        },
+
+        init: function () {
+          const d = this.data;
+          if (!d.src || d.src.indexOf("YOUR_") === 0) return;
+
+          const loader = new THREE.TextureLoader();
+          loader.setCrossOrigin("anonymous");
+          loader.load(
+            d.src,
+            (tex) => {
+              if ("colorSpace" in tex) tex.colorSpace = THREE.SRGBColorSpace;
+              const part = d.uMax - d.uMin;
+              const h =
+                d.height ||
+                (d.width * tex.image.height) / (tex.image.width * part);
+
+              const geo = new THREE.PlaneGeometry(d.width, h);
+              const uv = geo.attributes.uv;
+              for (let i = 0; i < uv.count; i++) {
+                uv.setX(i, d.uMin + uv.getX(i) * part);
+              }
+              uv.needsUpdate = true;
+
+              const mat = new THREE.MeshBasicMaterial({
+                map: tex,
+                transparent: true,
+                alphaTest: 0.01
+              });
+              this.el.setObject3D("mesh", new THREE.Mesh(geo, mat));
+            },
+            undefined,
+            () => console.warn("flat-image: could not load", d.src)
+          );
+        },
+
+        remove: function () {
+          this.el.removeObject3D("mesh");
+        }
+      });
+
+      // Builds the book, shows the spread when open, and runs the three-click sequence.
+      AFRAME.registerComponent("book-controller", {
+        schema: {
+          distance: { default: 1 },
+          dur: { default: 1600 },
+          openAngle: { default: -178 },
+          openDur: { default: 800 },
+          pageW: { default: 0.52 }, // one page; 2 x 0.52 / 0.8 matches the spread shape
+          pageH: { default: 0.8 }
+        },
+
+        init: function () {
+          this.buildBook();
+          this.home = this.el.object3D.position.clone();
+          this.busy = false;
+          // Steps: 0 = at home, 1 = at viewer (closed), 2 = open, 3 = closing then returning
+          this.step = 0;
+
+          this.el.addEventListener("animationcomplete__move", () => {
+            if (this.step === 3) {
+              this.step = 0;
+              this.el.sceneEl.emit("book-home", { book: this.el });
+            }
+            this.busy = false;
+          });
+
+          this.hinge.addEventListener("animationcomplete__swing", () => {
+            if (this.step === 3) {
+              this.travel(this.home, "y", "easeInOutCubic", "easeInOutSine");
+            } else {
+              this.busy = false;
+              if (this.step === 2) {
+                this.el.sceneEl.emit("book-opened", { book: this.el });
+              }
+            }
+          });
+
+          this.el.addEventListener("click", () => {
+            if (this.busy) return;
+            this.busy = true;
+
+            if (this.step === 0) {
+              // Offset by half a page, so the OPEN spread is centered in front of the viewer.
+              const target = new THREE.Vector3(
+                this.data.pageW / 2,
+                0,
+                -this.data.distance
+              );
+              this.el.sceneEl.camera.localToWorld(target);
+              this.travel(target, "y", "easeInOutCubic", "easeInOutSine");
+              this.el.sceneEl.emit("book-leaving", { book: this.el });
+              this.step = 1;
+            } else if (this.step === 1) {
+              this.swing(this.data.openAngle);
+              this.step = 2;
+            } else if (this.step === 2) {
+              this.el.sceneEl.emit("book-closing", { book: this.el });
+              this.swing(0);
+              this.step = 3;
+            }
+          });
+        },
+
+        buildBook: function () {
+          const W = this.data.pageW;
+          const H = this.data.pageH;
+          const make = (tag, attrs, parent) => {
+            const e = document.createElement(tag);
+            for (const k in attrs) e.setAttribute(k, attrs[k]);
+            parent.appendChild(e);
+            return e;
+          };
+
+          // back cover
+          make(
+            "a-box",
+            {
+              position: "0 0 -0.025",
+              width: W,
+              height: H,
+              depth: 0.01,
+              color: "#5a3e2b"
+            },
+            this.el
+          );
+          // pages
+          const pages = make(
+            "a-box",
+            {
+              position: "0 0 0",
+              width: W - 0.01,
+              height: H - 0.01,
+              depth: 0.04,
+              color: "#f5f0e1"
+            },
+            this.el
+          );
+          // hinge at the spine, with the front cover offset by half its width
+          this.hinge = make(
+            "a-entity",
+            { class: "hinge", position: `${-W / 2} 0 0.031` },
+            this.el
+          );
+          const cover = make(
+            "a-box",
+            {
+              position: `${W / 2} 0 0`,
+              width: W,
+              height: H,
+              depth: 0.02,
+              color: "#8b2e2e"
+            },
+            this.hinge
+          );
+
+          // Front cover image: on the outside of the cover, facing the viewer.
+          const front = make("a-entity", { position: "0 0 0.0103" }, cover);
+          front.setAttribute("flat-image", {
+            src: COVER_IMAGE,
+            width: W,
+            height: H
+          });
+
+          // Back cover image: on the outside of the back cover, facing away from the pages.
+          const back = make(
+            "a-entity",
+            { position: "0 0 -0.0303", rotation: "0 180 0" },
+            this.el
+          );
+          back.setAttribute("flat-image", {
+            src: BACK_COVER_IMAGE,
+            width: W,
+            height: H
+          });
+
+          // Left half of the spread: on the inside of the cover, turned to face the pages.
+          const left = make(
+            "a-entity",
+            { position: "0 0 -0.0103", rotation: "0 180 0" },
+            cover
+          );
+          left.setAttribute("flat-image", {
+            src: SPREAD_IMAGE,
+            width: W,
+            height: H,
+            uMin: 0,
+            uMax: 0.5
+          });
+
+          // Right half of the spread: on the front of the pages.
+          const right = make("a-entity", { position: "0 0 0.0203" }, pages);
+          right.setAttribute("flat-image", {
+            src: SPREAD_IMAGE,
+            width: W,
+            height: H,
+            uMin: 0.5,
+            uMax: 1
+          });
+        },
+
+        travel: function (pos, rotAxis, posEasing, rotEasing) {
+          const r = this.el.getAttribute("rotation");
+          const rot = { x: r.x, y: r.y, z: r.z };
+          rot[rotAxis] += 360;
+          this.el.setAttribute("animation__move", {
+            property: "position",
+            to: `${pos.x} ${pos.y} ${pos.z}`,
+            dur: this.data.dur,
+            easing: posEasing
+          });
+          this.el.setAttribute("animation__spin", {
+            property: "rotation",
+            to: `${rot.x} ${rot.y} ${rot.z}`,
+            dur: this.data.dur,
+            easing: rotEasing
+          });
+        },
+
+        swing: function (angle) {
+          this.hinge.setAttribute("animation__swing", {
+            property: "rotation",
+            to: `0 ${angle} 0`,
+            dur: this.data.openDur,
+            easing: "easeInOutQuad"
+          });
+        }
+      });
+
+      // Pieces fly out of the book when it opens, then drift on their own.
+      // The mouse pushes them away. You can drag them and throw them.
+      // They fly back into the book when it closes.
+      AFRAME.registerComponent("float-pieces", {
+        schema: {
+          minDist: { default: 2.2 },
+          maxDist: { default: 3.4 },
+          width: { default: 1.0 },
+          stagger: { default: 150 },
+          repelRadius: { default: 0.8 }, // meters from the mouse ray
+          repelStrength: { default: 7 },
+          damping: { default: 1.6 }, // higher = pieces stop sooner
+          wander: { default: 0.2 }, // strength of the drift on their own
+          holdDist: { default: 1.5 }, // meters from the camera while held
+          holdFollow: { default: 4 }, // how quickly a held piece glides to the mouse
+          returnStrength: { default: 2.5 }, // how firmly a released piece goes back out
+          throwKeep: { default: 0.6 }, // part of the hand speed a released piece keeps
+          maxThrow: { default: 4 }, // meters per second
+          spinThreshold: { default: 1.5 }, // releases faster than this (m/s) make one slow turn
+          spinDur: { default: 2.4 } // seconds for that turn
+        },
+
+        init: function () {
+          this.pieces = [];
+          FLOAT_IMAGES.forEach((item) => {
+            const cfg = typeof item === "string" ? { src: item } : item;
+            const outer = document.createElement("a-entity");
+            outer.setAttribute("visible", false);
+            outer.setAttribute("scale", "0.001 0.001 0.001");
+
+            // Inner entity bobs up and down, separate from all other movement.
+            const inner = document.createElement("a-entity");
+            inner.setAttribute("flat-image", {
+              src: cfg.src,
+              width: cfg.width || this.data.width
+            });
+            inner.setAttribute("animation__bob", {
+              property: "position",
+              from: "0 0 0",
+              to: "0 0.06 0",
+              dur: 1800 + Math.random() * 1200,
+              dir: "alternate",
+              loop: true,
+              easing: "easeInOutSine"
+            });
+
+            outer.appendChild(inner);
+            this.el.appendChild(outer);
+
+            const st = {
+              outer: outer,
+              inner: inner,
+              phase: "hidden", // hidden, in, active, out
+              vel: new THREE.Vector3(),
+              target: new THREE.Vector3(), // where a held piece glides to
+              homeDist: 0, // distance from the camera before it was picked up
+              returning: false,
+              ph1: Math.random() * 6.28,
+              ph2: Math.random() * 6.28,
+              sway: 2 + Math.random() * 3, // degrees of side-to-side tilt
+              spinT: -1, // spin progress 0..1, or -1 for no spin
+              spinDir: 1,
+              spinAngle: 0
+            };
+            outer.addEventListener("animationcomplete__fly", () => {
+              if (st.phase === "in") {
+                st.phase = "active";
+                st.vel.set(0, 0, 0);
+              } else if (st.phase === "out") {
+                st.phase = "hidden";
+                outer.setAttribute("visible", false);
+              }
+            });
+            this.pieces.push(st);
+          });
+
+          this.raycaster = new THREE.Raycaster();
+          this.mouse = new THREE.Vector2();
+          this.mouseInside = false;
+          this.held = null;
+          this.dragPlane = new THREE.Plane();
+          this.dragPoint = new THREE.Vector3();
+          this.force = new THREE.Vector3();
+          this.closest = new THREE.Vector3();
+          this.away = new THREE.Vector3();
+          this.flat = new THREE.Vector3();
+          this.radial = new THREE.Vector3();
+          this.prev = new THREE.Vector3();
+          this.camPos = new THREE.Vector3();
+
+          this.onDown = this.onDown.bind(this);
+          this.onMove = this.onMove.bind(this);
+          this.onUp = this.onUp.bind(this);
+
+          const scene = this.el.sceneEl;
+          const attach = () => {
+            this.canvas = scene.canvas;
+            // Capture phase: this runs before the camera controls and the click cursor.
+            this.canvas.addEventListener("pointerdown", this.onDown, true);
+            window.addEventListener("pointermove", this.onMove);
+            window.addEventListener("pointerup", this.onUp);
+            this.canvas.addEventListener("pointerleave", () => {
+              this.mouseInside = false;
+            });
+          };
+          if (scene.canvas) attach();
+          else scene.addEventListener("render-target-loaded", attach);
+
+          scene.addEventListener("book-opened", (e) =>
+            this.show(e.detail.book)
+          );
+          scene.addEventListener("book-closing", () => this.hide());
+        },
+
+        restart: function (el, name, cfg) {
+          el.removeAttribute(name);
+          el.setAttribute(name, cfg);
+        },
+
+        // ---------- mouse ----------
+
+        updateMouse: function (e) {
+          if (!this.canvas) return;
+          const r = this.canvas.getBoundingClientRect();
+          this.mouse.set(
+            ((e.clientX - r.left) / r.width) * 2 - 1,
+            -((e.clientY - r.top) / r.height) * 2 + 1
+          );
+          this.mouseInside =
+            e.clientX >= r.left &&
+            e.clientX <= r.right &&
+            e.clientY >= r.top &&
+            e.clientY <= r.bottom;
+          this.raycaster.setFromCamera(this.mouse, this.el.sceneEl.camera);
+        },
+
+        setLook: function (on) {
+          const camEl = this.el.sceneEl.camera && this.el.sceneEl.camera.el;
+          if (camEl && camEl.components["look-controls"]) {
+            camEl.setAttribute("look-controls", "enabled", on);
+          }
+        },
+
+        // Press on a piece: it slows down and glides closer to the camera.
+        onDown: function (e) {
+          this.updateMouse(e);
+          const meshes = [];
+          const owner = new Map();
+          this.pieces.forEach((st) => {
+            if (st.phase !== "active") return;
+            const m = st.inner.getObject3D("mesh");
+            if (m) {
+              meshes.push(m);
+              owner.set(m, st);
+            }
+          });
+          const hits = this.raycaster.intersectObjects(meshes, false);
+          if (!hits.length) return; // not on a piece: let the camera and the book have it
+
+          e.preventDefault();
+          e.stopImmediatePropagation();
+
+          const st = owner.get(hits[0].object);
+          const cam = this.el.sceneEl.camera;
+          cam.getWorldPosition(this.camPos);
+
+          // Remember how far out it was, unless it is still on its way back from a last hold.
+          if (!st.returning)
+            st.homeDist = st.outer.object3D.position.distanceTo(this.camPos);
+          st.returning = false;
+          st.vel.set(0, 0, 0);
+
+          // The held piece moves on a flat surface at holdDist in front of the camera.
+          const camDir = new THREE.Vector3();
+          cam.getWorldDirection(camDir);
+          const ray = this.raycaster.ray;
+          const near = ray.origin
+            .clone()
+            .addScaledVector(ray.direction, this.data.holdDist);
+          this.dragPlane.setFromNormalAndCoplanarPoint(camDir, near);
+          st.target.copy(near);
+
+          this.held = st;
+          this.lastMoveT = performance.now();
+          this.setLook(false);
+        },
+
+        onMove: function (e) {
+          this.updateMouse(e);
+          if (!this.held) return;
+          if (
+            this.raycaster.ray.intersectPlane(this.dragPlane, this.dragPoint)
+          ) {
+            this.held.target.copy(this.dragPoint);
+            this.lastMoveT = performance.now();
+          }
+        },
+
+        // Release: the piece drifts back out to its old distance and floats on.
+        onUp: function () {
+          if (!this.held) return;
+          const st = this.held;
+          const v = st.vel;
+          if (performance.now() - this.lastMoveT > 100) v.set(0, 0, 0); // still hand: no throw
+          const handSpeed = v.length();
+          v.multiplyScalar(this.data.throwKeep);
+          if (v.length() > this.data.maxThrow) v.setLength(this.data.maxThrow);
+
+          // A quick release: one slow, eased turn in the direction of the throw.
+          if (handSpeed > this.data.spinThreshold && st.spinT < 0) {
+            const camQuat = new THREE.Quaternion();
+            this.el.sceneEl.camera.getWorldQuaternion(camQuat);
+            const camRight = new THREE.Vector3(1, 0, 0).applyQuaternion(
+              camQuat
+            );
+            st.spinDir = -(Math.sign(v.dot(camRight)) || 1);
+            st.spinT = 0;
+          }
+
+          st.returning = true;
+          this.held = null;
+          this.setLook(true);
+        },
+
+        // ---------- movement every frame ----------
+
+        tick: function (t, dtMs) {
+          const dt = Math.min(dtMs / 1000, 0.05);
+          const cam = this.el.sceneEl.camera;
+          if (!dt || !cam) return;
+          cam.getWorldPosition(this.camPos);
+          if (this.mouseInside) this.raycaster.setFromCamera(this.mouse, cam);
+
+          const d = this.data;
+          const time = t / 1000;
+          const camPos = this.camPos;
+
+          this.pieces.forEach((st) => {
+            if (st.phase !== "active") return;
+            const obj = st.outer.object3D;
+            const pos = obj.position;
+
+            if (st === this.held) {
+              // Glide toward the mouse, close to the camera. Track speed for the release.
+              this.prev.copy(pos);
+              pos.lerp(st.target, 1 - Math.exp(-d.holdFollow * dt));
+              const v = this.prev.sub(pos).multiplyScalar(-1 / dt);
+              st.vel.lerp(v, 0.3);
+            } else {
+              // Drift on their own: slow, different for each piece.
+              const f = this.force.set(
+                Math.sin(time * 0.31 + st.ph1) * d.wander,
+                Math.cos(time * 0.23 + st.ph2) * d.wander * 0.6,
+                Math.sin(time * 0.17 + st.ph2) * d.wander
+              );
+
+              // Push away from the mouse.
+              if (this.mouseInside && !this.held) {
+                this.raycaster.ray.closestPointToPoint(pos, this.closest);
+                const away = this.away.copy(pos).sub(this.closest);
+                const dist = away.length();
+                if (dist < d.repelRadius && dist > 0.0001) {
+                  f.addScaledVector(
+                    away.divideScalar(dist),
+                    d.repelStrength * (1 - dist / d.repelRadius)
+                  );
+                }
+              }
+
+              if (st.returning) {
+                // After a hold: ease back out to the old distance from the camera.
+                const radial = this.radial.copy(pos).sub(camPos);
+                const r = radial.length();
+                if (r > 0.0001) radial.divideScalar(r);
+                const gap = st.homeDist - r;
+                f.addScaledVector(radial, d.returnStrength * gap);
+                if (Math.abs(gap) < 0.08 && st.vel.length() < 0.3)
+                  st.returning = false;
+              } else {
+                // Soft walls: stay around the viewer, not too near, not too far.
+                const flat = this.flat.set(
+                  pos.x - camPos.x,
+                  0,
+                  pos.z - camPos.z
+                );
+                const r = flat.length();
+                if (r > 0.0001) flat.divideScalar(r);
+                if (r < d.minDist * 0.7)
+                  f.addScaledVector(flat, 3 * (d.minDist * 0.7 - r));
+                else if (r > d.maxDist + 1)
+                  f.addScaledVector(flat, -3 * (r - d.maxDist - 1));
+              }
+              const dy = pos.y - camPos.y;
+              if (dy < -1.2) f.y += 3 * (-1.2 - dy);
+              else if (dy > 1.8) f.y -= 3 * (dy - 1.8);
+
+              st.vel.addScaledVector(f, dt);
+              st.vel.multiplyScalar(Math.exp(-d.damping * dt));
+              pos.addScaledVector(st.vel, dt);
+            }
+
+            // Spin: one full turn, eased in and out, so it starts and ends gently.
+            if (st.spinT >= 0) {
+              st.spinT += dt / d.spinDur;
+              const k = Math.min(st.spinT, 1);
+              st.spinAngle =
+                st.spinDir * 360 * (0.5 - 0.5 * Math.cos(Math.PI * k));
+              if (st.spinT >= 1) {
+                st.spinT = -1;
+                st.spinAngle = 0;
+              }
+            }
+
+            // Face the viewer, stay upright, with a slow tilt (plus any spin).
+            obj.lookAt(camPos.x, pos.y, camPos.z);
+            obj.rotateZ(
+              THREE.MathUtils.degToRad(
+                Math.sin(time * 0.6 + st.ph1) * st.sway + st.spinAngle
+              )
+            );
+          });
+        },
+
+        // ---------- open and close ----------
+
+        show: function (bookEl) {
+          const cam = this.el.sceneEl.camera;
+          const camPos = new THREE.Vector3();
+          const camQuat = new THREE.Quaternion();
+          cam.getWorldPosition(camPos);
+          cam.getWorldQuaternion(camQuat);
+
+          const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camQuat);
+          fwd.y = 0;
+          fwd.normalize();
+
+          this.origin = new THREE.Vector3();
+          bookEl.object3D.getWorldPosition(this.origin);
+          const o = this.origin;
+
+          const n = this.pieces.length;
+          const perSide = Math.ceil(n / 2);
+
+          this.pieces.forEach((st, i) => {
+            const el = st.outer;
+            // Alternate left and right, and keep the center clear for the book.
+            const side = i % 2 === 0 ? 1 : -1;
+            const k = Math.floor(i / 2);
+            const spread = perSide === 1 ? 0.5 : k / (perSide - 1);
+            const angle = side * (30 + spread * 45);
+
+            const dir = fwd
+              .clone()
+              .applyAxisAngle(
+                new THREE.Vector3(0, 1, 0),
+                THREE.MathUtils.degToRad(angle)
+              );
+            const dist =
+              this.data.minDist +
+              Math.random() * (this.data.maxDist - this.data.minDist);
+            const p = camPos.clone().addScaledVector(dir, dist);
+            p.y = camPos.y - 0.4 + (k % 3) * 0.6 + Math.random() * 0.2;
+
+            el.object3D.position.copy(p);
+            el.object3D.lookAt(camPos.x, p.y, camPos.z);
+            el.setAttribute("visible", true);
+            st.phase = "in";
+            st.vel.set(0, 0, 0);
+            st.spinT = -1;
+            st.spinAngle = 0;
+            st.returning = false;
+
+            const delay = i * this.data.stagger;
+            this.restart(el, "animation__fly", {
+              property: "position",
+              from: `${o.x} ${o.y} ${o.z}`,
+              to: `${p.x} ${p.y} ${p.z}`,
+              dur: 900,
+              delay: delay,
+              easing: "easeOutCubic"
+            });
+            this.restart(el, "animation__grow", {
+              property: "scale",
+              from: "0.001 0.001 0.001",
+              to: "1 1 1",
+              dur: 900,
+              delay: delay,
+              easing: "easeOutCubic"
+            });
+          });
+        },
+
+        hide: function () {
+          if (!this.origin) return;
+          if (this.held) {
+            this.held = null;
+            this.setLook(true);
+          }
+          const o = this.origin;
+          this.pieces.forEach((st, i) => {
+            if (st.phase === "hidden") return;
+            const el = st.outer;
+            const p = el.object3D.position;
+            st.phase = "out";
+            const delay = i * 60;
+            this.restart(el, "animation__fly", {
+              property: "position",
+              from: `${p.x} ${p.y} ${p.z}`,
+              to: `${o.x} ${o.y} ${o.z}`,
+              dur: 600,
+              delay: delay,
+              easing: "easeInCubic"
+            });
+            this.restart(el, "animation__grow", {
+              property: "scale",
+              from: "1 1 1",
+              to: "0.001 0.001 0.001",
+              dur: 600,
+              delay: delay,
+              easing: "easeInCubic"
+            });
+          });
+        }
+      });
+
+      // Play/pause button under the open spread. It controls the YouTube sky video.
+      AFRAME.registerComponent("music-player", {
+        schema: {
+          showWithBook: { default: true }, // appear when the book opens, go away when it closes
+          stopOnClose: { default: true }, // stop the sound when the book closes
+          distance: { default: 0.95 }, // meters in front of the viewer
+          drop: { default: 0.62 } // meters below eye height (under the open spread)
+        },
+
+        init: function () {
+          const P = MUSIC_PLAYER;
+
+          this.button = document.createElement("a-entity");
+          this.button.setAttribute("class", "clickable");
+          this.button.setAttribute("position", `${P.buttonX} ${P.buttonY} 0`);
+
+          // Invisible square that catches the click, so the button works before the PNGs load.
+          const hit = document.createElement("a-plane");
+          hit.setAttribute("width", P.buttonSize);
+          hit.setAttribute("height", P.buttonSize);
+          hit.setAttribute(
+            "material",
+            "transparent: true; opacity: 0; depthWrite: false"
+          );
+          this.button.appendChild(hit);
+
+          this.playIcon = document.createElement("a-entity");
+          this.playIcon.setAttribute("flat-image", {
+            src: P.play,
+            width: P.buttonSize
+          });
+          this.pauseIcon = document.createElement("a-entity");
+          this.pauseIcon.setAttribute("flat-image", {
+            src: P.pause,
+            width: P.buttonSize
+          });
+          this.pauseIcon.setAttribute("visible", false);
+          this.button.appendChild(this.playIcon);
+          this.button.appendChild(this.pauseIcon);
+          this.el.appendChild(this.button);
+
+          this.button.addEventListener("click", () => this.toggle());
+
+          // Pause/play mode only: keep the icon correct if the song ends.
+          if (!SKY_VIDEO_ALWAYS_PLAYS) {
+            window.addEventListener("yt-state", (e) => {
+              if (e.detail === YT.PlayerState.PLAYING) this.setIcon(true);
+              else if (
+                e.detail === YT.PlayerState.PAUSED ||
+                e.detail === YT.PlayerState.ENDED
+              )
+                this.setIcon(false);
+            });
+          }
+
+          if (this.data.showWithBook) {
+            this.el.setAttribute("visible", false);
+            this.el.setAttribute("scale", "0.001 0.001 0.001");
+            this.el.sceneEl.addEventListener("book-opened", () => this.show());
+            this.el.sceneEl.addEventListener("book-closing", () => this.hide());
+          }
+        },
+
+        toggle: function () {
+          if (!window.ytReady) {
+            console.warn("music-player: the YouTube player is not ready yet");
+            return;
+          }
+          const p = window.ytPlayer;
+          if (SKY_VIDEO_ALWAYS_PLAYS) {
+            if (p.isMuted()) {
+              p.unMute();
+              p.setVolume(100);
+              p.playVideo();
+              this.setIcon(true);
+            } else {
+              p.mute();
+              this.setIcon(false);
+            }
+          } else {
+            const s = p.getPlayerState();
+            if (
+              s === YT.PlayerState.PLAYING ||
+              s === YT.PlayerState.BUFFERING
+            ) {
+              p.pauseVideo();
+              this.setIcon(false);
+            } else {
+              p.playVideo();
+              this.setIcon(true);
+            }
+          }
+        },
+
+        // Sound on: show the pause icon. Sound off: show the play icon.
+        setIcon: function (playing) {
+          this.playIcon.setAttribute("visible", !playing);
+          this.pauseIcon.setAttribute("visible", playing);
+        },
+
+        restart: function (name, cfg) {
+          this.el.removeAttribute(name);
+          this.el.setAttribute(name, cfg);
+        },
+
+        show: function () {
+          const cam = this.el.sceneEl.camera;
+          const camPos = new THREE.Vector3();
+          const camQuat = new THREE.Quaternion();
+          cam.getWorldPosition(camPos);
+          cam.getWorldQuaternion(camQuat);
+
+          const fwd = new THREE.Vector3(0, 0, -1).applyQuaternion(camQuat);
+          fwd.y = 0;
+          fwd.normalize();
+
+          const p = camPos.clone().addScaledVector(fwd, this.data.distance);
+          p.y -= this.data.drop;
+          this.el.object3D.position.copy(p);
+          this.el.object3D.lookAt(camPos); // tilt up toward the viewer
+          this.el.setAttribute("visible", true);
+
+          this.restart("animation__grow", {
+            property: "scale",
+            from: "0.001 0.001 0.001",
+            to: "1 1 1",
+            dur: 500,
+            delay: 300,
+            easing: "easeOutBack"
+          });
+        },
+
+        hide: function () {
+          this.restart("animation__grow", {
+            property: "scale",
+            to: "0.001 0.001 0.001",
+            dur: 300,
+            easing: "easeInQuad"
+          });
+          if (this.data.stopOnClose && window.ytReady) {
+            if (SKY_VIDEO_ALWAYS_PLAYS) window.ytPlayer.mute();
+            else window.ytPlayer.pauseVideo();
+            this.setIcon(false);
+          }
+        }
+      });
+
+      // Low-poly forest: trees, bushes and flowers, with a clear area around the viewer and the shelf.
+      AFRAME.registerComponent("landscape", {
+        schema: {
+          seed: { default: 7 },
+          radius: { default: 35 },
+          clear: { default: 7.5 },
+          trees: { default: 110 },
+          bushes: { default: 80 },
+          flowerPatches: { default: 35 }
+        },
+
+        init: function () {
+          let s = this.data.seed; // must not be 0
+          this.rand = () => {
+            s = (s * 16807) % 2147483647;
+            return (s - 1) / 2147483646;
+          };
+          for (let i = 0; i < this.data.trees; i++)
+            this.tree(this.spot(this.data.clear, this.data.radius));
+          for (let i = 0; i < this.data.bushes; i++)
+            this.bush(this.spot(this.data.clear - 1, this.data.radius));
+          for (let i = 0; i < this.data.flowerPatches; i++)
+            this.flowerPatch(this.spot(2.5, 16));
+        },
+
+        pick: function (list) {
+          return list[Math.floor(this.rand() * list.length)];
+        },
+
+        spot: function (minR, maxR) {
+          const a = this.rand() * Math.PI * 2;
+          const r = minR + this.rand() * (maxR - minR);
+          return { x: Math.cos(a) * r, z: Math.sin(a) * r };
+        },
+
+        make: function (tag, attrs, parent) {
+          const e = document.createElement(tag);
+          for (const k in attrs) e.setAttribute(k, attrs[k]);
+          parent.appendChild(e);
+          return e;
+        },
+
+        mat: function (color) {
+          return `color: ${color}; flatShading: true`;
+        },
+
+        tree: function (p) {
+          const g = this.make(
+            "a-entity",
+            {
+              position: `${p.x} 0 ${p.z}`,
+              rotation: `0 ${this.rand() * 360} 0`
+            },
+            this.el
+          );
+          const h = 1.5 + this.rand() * 2.5;
+          this.make(
+            "a-cylinder",
+            {
+              position: `0 ${h / 2} 0`,
+              radius: 0.18,
+              height: h,
+              "segments-radial": 6,
+              material: this.mat("#5a3a22")
+            },
+            g
+          );
+          if (this.rand() < 0.55) {
+            // Pine
+            const ch = 3 + this.rand() * 1.5;
+            this.make(
+              "a-cone",
+              {
+                position: `0 ${h + ch / 2 - 0.4} 0`,
+                "radius-bottom": 1.3,
+                "radius-top": 0,
+                height: ch,
+                "segments-radial": 7,
+                material: this.mat(this.pick(["#2f5d3a", "#3a6b40", "#25503a"]))
+              },
+              g
+            );
+          } else {
+            // Round leafy tree
+            this.make(
+              "a-sphere",
+              {
+                position: `0 ${h + 0.7} 0`,
+                radius: 1.1 + this.rand() * 0.6,
+                "segments-width": 7,
+                "segments-height": 5,
+                material: this.mat(this.pick(["#4f8a3c", "#5e9b45", "#447a35"]))
+              },
+              g
+            );
+          }
+        },
+
+        bush: function (p) {
+          const g = this.make(
+            "a-entity",
+            { position: `${p.x} 0 ${p.z}` },
+            this.el
+          );
+          const color = this.pick(["#3f7a34", "#4a8a3a", "#356b2e"]);
+          const n = 2 + Math.floor(this.rand() * 3);
+          for (let i = 0; i < n; i++) {
+            const r = 0.4 + this.rand() * 0.4;
+            this.make(
+              "a-sphere",
+              {
+                position: `${(this.rand() - 0.5) * 0.9} ${r * 0.7} ${(this.rand() - 0.5) * 0.9}`,
+                radius: r,
+                "segments-width": 6,
+                "segments-height": 4,
+                material: this.mat(color)
+              },
+              g
+            );
+          }
+        },
+
+        flowerPatch: function (p) {
+          const color = this.pick([
+            "#e84a5f",
+            "#f7d046",
+            "#ffffff",
+            "#b57edc",
+            "#ff8c42"
+          ]);
+          const n = 4 + Math.floor(this.rand() * 6);
+          for (let i = 0; i < n; i++) {
+            const x = p.x + (this.rand() - 0.5) * 1.5;
+            const z = p.z + (this.rand() - 0.5) * 1.5;
+            const h = 0.2 + this.rand() * 0.25;
+            const g = this.make(
+              "a-entity",
+              { position: `${x} 0 ${z}` },
+              this.el
+            );
+            this.make(
+              "a-cylinder",
+              {
+                position: `0 ${h / 2} 0`,
+                radius: 0.012,
+                height: h,
+                "segments-radial": 4,
+                material: this.mat("#3d7a2a")
+              },
+              g
+            );
+            this.make(
+              "a-sphere",
+              {
+                position: `0 ${h} 0`,
+                radius: 0.05,
+                "segments-width": 6,
+                "segments-height": 4,
+                material: this.mat(color)
+              },
+              g
+            );
+          }
+        }
+      });
+
+      // Fills a shelf with books of varied height and width, flush to the back, bottom and walls.
+      AFRAME.registerComponent("book-row", {
+        schema: {
+          seed: { default: 3 },
+          left: { default: -1.85 },
+          right: { default: 1.85 },
+          shelfTop: { default: 0.3 },
+          backZ: { default: -0.15 },
+          depth: { default: 0.3 },
+          minH: { default: 0.7 },
+          maxH: { default: 1.0 },
+          minW: { default: 0.12 },
+          maxW: { default: 0.24 },
+          gapChance: { default: 0.15 },
+          // soft orange, blue, pink and green, in several shades
+          colors: {
+            default:
+              "#f6b88a,#f2a477,#f9cfa8,#9fc5e8,#b7d3ef,#87b3dc,#f5b5c8,#f9c9d6,#ee9fb7,#a9d3a2,#c3e2b8,#8fc492"
+          },
+          textures: { default: "" } // comma list, for example: #spine1, #spine2, #spine3
+        },
+
+        init: function () {
+          const d = this.data;
+          let s = d.seed;
+          const rand = () => {
+            s = (s * 16807) % 2147483647;
+            return (s - 1) / 2147483646;
+          };
+          const range = (a, b) => a + rand() * (b - a);
+          const colors = d.colors.split(",");
+          const textures = d.textures
+            ? d.textures.split(",").map((t) => t.trim())
+            : [];
+          let x = d.left;
+          let n = 0;
+
+          while (x < d.right - 0.001) {
+            if (d.right - x > 0.5 && rand() < d.gapChance) {
+              x += range(0.01, 0.04);
+            }
+
+            const remaining = d.right - x;
+            if (remaining < d.minW) break;
+
+            let w = range(d.minW, d.maxW);
+            if (remaining - w < d.minW) {
+              w = remaining;
+            }
+            const h = range(d.minH, d.maxH);
+
+            const book = document.createElement("a-box");
+            book.setAttribute("id", `${this.el.id}-book${n + 1}`);
+            book.setAttribute(
+              "position",
+              `${x + w / 2} ${d.shelfTop + h / 2} ${d.backZ + d.depth / 2}`
+            );
+            book.setAttribute("width", w);
+            book.setAttribute("height", h);
+            book.setAttribute("depth", d.depth);
+            book.setAttribute(
+              "color",
+              colors[Math.floor(rand() * colors.length)]
+            );
+
+            if (textures.length) {
+              const spine = document.createElement("a-plane");
+              spine.setAttribute("width", w);
+              spine.setAttribute("height", h);
+              spine.setAttribute("position", `0 0 ${d.depth / 2 + 0.001}`);
+              spine.setAttribute(
+                "material",
+                `src: ${textures[n % textures.length]}`
+              );
+              book.appendChild(spine);
+            }
+
+            this.el.appendChild(book);
+            x += w;
+            n++;
+          }
+        }
+      });
+    </script>
   </head>
   <body>
-    <a-scene cursor="rayOrigin: mouse">
-      <!-- background -->
-      <a-sky color="Pink"></a-sky>
-      <a-plane
+    <!-- ".clickable *" also tests the parts INSIDE clickable entities (book pages, button hit area).
+         renderer alpha: the sky is transparent, so the video behind the canvas shows through. -->
+    <a-scene
+      cursor="rayOrigin: mouse"
+      raycaster="objects: .clickable, .clickable *"
+      renderer="alpha: true"
+      fog="type: linear; color: #e8957a; near: 12; far: 38"
+    >
+      <!-- Ground (no a-sky: the video is the sky) -->
+      <a-circle
+        radius="40"
         rotation="-90 0 0"
-        width="30"
-        height="30"
-        color="LightGrey"
-      ></a-plane>
+        material="color: #34502f; flatShading: true"
+      ></a-circle>
 
-      <!-- SEE-SAW -->
-      <a-box
-        position="0 0.4 -6"
-        width="0.3"
-        height="0.8"
-        depth="0.3"
-        color="gray"
-      ></a-box>
-      <!-- <a-box id="plank" position="0 0.85 -6" width="3" height="0.15" depth="0.4" color="lightgray"> </a-box> -->
+      <!-- Sunset lights: warm light from the sky, purple from the ground, low orange sun -->
+      <a-entity
+        light="type: hemisphere; color: #ffb48a; groundColor: #2c2440; intensity: 0.7"
+      ></a-entity>
+      <a-entity
+        light="type: directional; color: #ff8a50; intensity: 1.1"
+        position="4 1.2 3"
+      ></a-entity>
 
-      <a-box
-        id="circle"
-        position="0 5 -8"
-        width="3"
-        height="3"
-        depth="0"
-        color="Violet"
-        animation="property: rotation; to: 0 5 5; dur: 1200; dir: alternate; loop: true; easing: easeInOutSine"
-        <a-entity geometry="primitive: cone; width: 1; height: 1; depth: 1">
-        </a-entity>
-        
-      ></a-box>
+      <!-- Forest -->
+      <a-entity landscape="seed: 7"></a-entity>
 
-      <a-box
-        id="plank"
-        position="0 0.85 -6"
-        width="3"
-        height="0.15"
-        depth="0.4"
-        color="MediumAquamarine"
-        animation="property: scale; to: 6, 3, 2; dur: 1200; dir: alternate; loop: true; easing: easeInOutSine"
-        animation="property: rotation; to: 0 5 5; dur: 1200; dir: alternate; loop: true; easing: easeInOutSine"
-        <a-entity geometry="primitive: dodecahedron; width: 1; height: 1; depth: 1">
-        </a-entity>
-      ></a-box>
+      <!-- THE BOOK: sits on shelf 1 (top at 3.85), back against the back panel -->
+      <a-entity
+        class="clickable"
+        position="0 4.25 -5.72"
+        book-controller="distance: 1"
+      ></a-entity>
+
+      <!-- FLOATING PIECES (images are set in FLOAT_IMAGES at the top) -->
+      <a-entity float-pieces></a-entity>
+
+      <!-- MUSIC PLAYER (graphics and video are set in MUSIC_PLAYER and YOUTUBE_ID at the top) -->
+      <a-entity music-player></a-entity>
+
+      <!-- BOOKSHELF -->
+      <a-entity id="bookshelf" position="0 0 -5.6">
+        <a-box
+          id="backside"
+          position="0 2.75 -0.35"
+          width="4.3"
+          height="5.5"
+          depth="0.4"
+          color="#2e1a0f"
+        ></a-box>
+        <a-box
+          id="rightwall"
+          position="2 2.75 0"
+          width="0.3"
+          height="5.5"
+          depth="0.3"
+          color="#3e2415"
+        ></a-box>
+        <a-box
+          id="leftwall"
+          position="-2 2.75 0"
+          width="0.3"
+          height="5.5"
+          depth="0.3"
+          color="#3e2415"
+        ></a-box>
+        <a-box
+          id="ceiling"
+          position="0 5.35 0"
+          width="3.7"
+          height="0.3"
+          depth="0.3"
+          color="#3e2415"
+        ></a-box>
+        <a-box
+          id="floor"
+          position="0 0.15 0"
+          width="3.7"
+          height="0.3"
+          depth="0.3"
+          color="#3e2415"
+        ></a-box>
+        <a-box
+          id="shelf1"
+          position="0 3.8 0"
+          width="3.7"
+          height="0.1"
+          depth="0.3"
+          color="#2e1a0f"
+        ></a-box>
+        <a-box
+          id="shelf2"
+          position="0 2 0"
+          width="3.7"
+          height="0.1"
+          depth="0.3"
+          color="#2e1a0f"
+        ></a-box>
+
+        <!-- Shelf 1: two short rows, with a space in the middle for the book -->
+        <a-entity
+          id="row1a"
+          book-row="seed: 5; shelfTop: 3.85; left: -1.85; right: -0.32"
+        ></a-entity>
+        <a-entity
+          id="row1b"
+          book-row="seed: 17; shelfTop: 3.85; left: 0.32; right: 1.85"
+        ></a-entity>
+
+        <!-- Shelf 2 and the floor -->
+        <a-entity id="row2" book-row="seed: 11; shelfTop: 2.05"></a-entity>
+        <a-entity id="row3" book-row="seed: 23; shelfTop: 0.3"></a-entity>
+      </a-entity>
 
       <!-- camera -->
       <a-entity position="0 1.6 0">
         <a-camera></a-camera>
       </a-entity>
     </a-scene>
+
+    <!-- YouTube video behind the 3D scene, with the sunset tint over it -->
+    <div id="yt-wrap"><div id="yt-player"></div></div>
+    <div id="sky-tint"></div>
+    <div id="sky-veil"></div>
+
+    <script>
+      window.ytReady = false;
+
+      // YouTube calls this function by name when its API has loaded.
+      function onYouTubeIframeAPIReady() {
+        const vars = SKY_VIDEO_ALWAYS_PLAYS
+          ? {
+              autoplay: 1,
+              mute: 1, // browsers only allow autoplay when muted
+              controls: 0,
+              loop: 1,
+              playlist: YOUTUBE_ID, // needed for loop to work
+              playsinline: 1,
+              rel: 0,
+              disablekb: 1,
+              iv_load_policy: 3,
+              fs: 0
+            }
+          : { playsinline: 1, rel: 0, controls: 0 };
+
+        window.ytPlayer = new YT.Player("yt-player", {
+          width: "100%",
+          height: "100%",
+          videoId: YOUTUBE_ID,
+          playerVars: vars,
+          events: {
+            onReady: (e) => {
+              window.ytReady = true;
+              if (SKY_VIDEO_ALWAYS_PLAYS) {
+                e.target.mute();
+                e.target.playVideo();
+              }
+            },
+            onStateChange: (e) => {
+              window.dispatchEvent(
+                new CustomEvent("yt-state", { detail: e.data })
+              );
+            }
+          }
+        });
+      }
+    </script>
+    <script src="https://www.youtube.com/iframe_api"></script>
+
+    <script>
+      // Veil: fade it out when the book leaves the shelf, back in when the book is home again.
+      // To keep the video visible after the first click, delete the "book-home" line.
+      (function () {
+        const scene = document.querySelector("a-scene");
+        const veil = document.getElementById("sky-veil");
+        scene.addEventListener("book-leaving", () => (veil.style.opacity = 0));
+        scene.addEventListener("book-home", () => (veil.style.opacity = 1));
+      })();
+    </script>
   </body>
 </html>
